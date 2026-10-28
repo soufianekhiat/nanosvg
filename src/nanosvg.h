@@ -373,7 +373,20 @@ int nsvg__parseXML(char* input,
 	char* mark = s;
 	int state = NSVG_XML_CONTENT;
 	while (*s) {
-		if (*s == '<' && state == NSVG_XML_CONTENT) {
+		if (*s == '<' && state == NSVG_XML_CONTENT && (strncmp(s, "<![CDATA[", 9) == 0 || strncmp(s, "<!--", 4) == 0)) {
+			// ImWidgets change: a CDATA section is content (style sheets are often wrapped in one), a comment is
+			// skipped whole (both were read as a tag ending at their first '>', swallowing the rest).
+			const int cdata = s[2] == '[';
+			char* end = strstr(s + (cdata ? 9 : 4), cdata ? "]]>" : "-->");
+			*s = '\0';
+			nsvg__parseContent(mark, contentCb, ud);
+			if (end == NULL)
+				break;
+			*end = '\0';
+			if (cdata)
+				nsvg__parseContent(s + 9, contentCb, ud);
+			s = mark = end + 3;
+		} else if (*s == '<' && state == NSVG_XML_CONTENT) {
 			// Start of a tag
 			*s++ = '\0';
 			nsvg__parseContent(mark, contentCb, ud);
