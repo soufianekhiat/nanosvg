@@ -198,6 +198,7 @@ typedef struct NSVGshape
 	// filterGroups: which element set each (the shapes of one group share its number).
 	char maskId[64];
 	char maskOf[64];
+	char patternOf[64];			// The <pattern> this shape is content of (in the pattern's space; not drawn itself).
 	char filterIds[NSVG_MAX_FILTERS][64];
 	int filterGroups[NSVG_MAX_FILTERS];
 	int filterCount;
@@ -238,12 +239,32 @@ typedef struct NSVGfilter
 	struct NSVGfilter* next;
 } NSVGfilter;
 
+// ImWidgets change: a <pattern>'s attributes (its content: shapes with NSVGshape::patternOf). Attributes it does not
+// set (NSVG_PATTERN_SET_*) and its content, when it has none, come from the pattern it references (href).
+enum NSVGpatternSet {
+	NSVG_PATTERN_SET_X = 1 << 0, NSVG_PATTERN_SET_Y = 1 << 1, NSVG_PATTERN_SET_WIDTH = 1 << 2, NSVG_PATTERN_SET_HEIGHT = 1 << 3,
+	NSVG_PATTERN_SET_UNITS = 1 << 4, NSVG_PATTERN_SET_CONTENT_UNITS = 1 << 5, NSVG_PATTERN_SET_XFORM = 1 << 6,
+};
+
+typedef struct NSVGpattern
+{
+	char id[64];
+	char href[64];
+	float x, y, width, height;
+	char userSpace;				// patternUnits="userSpaceOnUse" (else objectBoundingBox: fractions of the shape's bounds).
+	char contentBox;			// patternContentUnits="objectBoundingBox".
+	float xform[6];				// patternTransform.
+	int set;					// NSVGpatternSet.
+	struct NSVGpattern* next;
+} NSVGpattern;
+
 typedef struct NSVGimage
 {
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
 	NSVGfilter* filters;		// ImWidgets change
+	NSVGpattern* patterns;		// ImWidgets change
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -595,6 +616,7 @@ typedef struct NSVGparser
 	// ImWidgets change: inside <mask>, its id (its shapes are made, tagged NSVGshape::maskOf); inside <filter>, the
 	// filter its primitives go to; the last filter group number given.
 	char maskCurrent[64];
+	char patternCurrent[64];	// ImWidgets change: inside <pattern>, its id (its shapes are made, tagged NSVGshape::patternOf).
 	NSVGfilter* filterCurrent;
 	int filterGroupCount;
 	char* textBuf;
@@ -1309,6 +1331,7 @@ static void nsvg__addShape(NSVGparser* p)
 	shape->hasClip = attr->hasClip;		// ImWidgets change
 	memcpy(shape->maskId, attr->maskId, sizeof(shape->maskId));
 	memcpy(shape->maskOf, p->maskCurrent, sizeof(shape->maskOf));
+	memcpy(shape->patternOf, p->patternCurrent, sizeof(shape->patternOf));
 	memcpy(shape->filterIds, attr->filterIds, sizeof(shape->filterIds));
 	memcpy(shape->filterGroups, attr->filterGroups, sizeof(shape->filterGroups));
 	shape->filterCount = attr->filterCount;
@@ -3646,6 +3669,40 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 			nsvg__parseFilterPrim(p, el, attr);
 		return;
 	}
+	if (strcmp(el, "pattern") == 0) {		// ImWidgets change: its attributes; its shapes are made in its space, tagged with its id.
+		NSVGpattern* pat = (NSVGpattern*)calloc(1, sizeof(NSVGpattern));
+		NSVGattrib* a;
+		int i, plainHref = 0;
+		if (pat == NULL) return;
+		nsvg__xformIdentity(pat->xform);
+		for (i = 0; attr[i]; i += 2) {
+			const char* name = attr[i];
+			const char* value = attr[i + 1];
+			if (strcmp(name, "id") == 0) strncpy(pat->id, value, 63);
+			else if (strcmp(name, "href") == 0 || (strcmp(name, "xlink:href") == 0 && !plainHref)) {
+				plainHref |= strcmp(name, "href") == 0;
+				strncpy(pat->href, value[0] == '#' ? value + 1 : value, 63);
+			}
+			else if (strcmp(name, "x") == 0) { pat->x = (float)nsvg__atof(value); pat->set |= NSVG_PATTERN_SET_X; }
+			else if (strcmp(name, "y") == 0) { pat->y = (float)nsvg__atof(value); pat->set |= NSVG_PATTERN_SET_Y; }
+			else if (strcmp(name, "width") == 0) { pat->width = (float)nsvg__atof(value); pat->set |= NSVG_PATTERN_SET_WIDTH; }
+			else if (strcmp(name, "height") == 0) { pat->height = (float)nsvg__atof(value); pat->set |= NSVG_PATTERN_SET_HEIGHT; }
+			else if (strcmp(name, "patternUnits") == 0) { pat->userSpace = strcmp(value, "userSpaceOnUse") == 0; pat->set |= NSVG_PATTERN_SET_UNITS; }
+			else if (strcmp(name, "patternContentUnits") == 0) { pat->contentBox = strcmp(value, "objectBoundingBox") == 0; pat->set |= NSVG_PATTERN_SET_CONTENT_UNITS; }
+			else if (strcmp(name, "patternTransform") == 0) { nsvg__parseTransform(pat->xform, value); pat->set |= NSVG_PATTERN_SET_XFORM; }
+		}
+		pat->next = p->image->patterns;
+		p->image->patterns = pat;
+		nsvg__pushAttr(p);
+		a = nsvg__getAttr(p);
+		nsvg__xformIdentity(a->xform);
+		a->hasClip = 0;
+		a->clipData = NULL;
+		a->maskId[0] = '\0';
+		a->filterCount = 0;
+		strncpy(p->patternCurrent, pat->id, 63);
+		return;
+	}
 	if (strcmp(el, "mask") == 0) {		// ImWidgets change: its shapes are made, tagged with its id.
 		int i;
 		nsvg__pushAttr(p);
@@ -3674,7 +3731,7 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__getAttr(p)->hasClip = 0;
 		return;
 	}
-	if (p->defsFlag && p->clipCurrent == NULL && p->maskCurrent[0] == '\0') {
+	if (p->defsFlag && p->clipCurrent == NULL && p->maskCurrent[0] == '\0' && p->patternCurrent[0] == '\0') {
 		// Skip everything but gradients and styles in defs
 		if (strcmp(el, "linearGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_LINEAR_GRADIENT);
@@ -3787,6 +3844,9 @@ static void nsvg__endElement(void* ud, const char* el)
 		p->filterCurrent = NULL;
 	} else if (strcmp(el, "mask") == 0 && p->maskCurrent[0] != '\0') {		// ImWidgets change
 		p->maskCurrent[0] = '\0';
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "pattern") == 0 && p->patternCurrent[0] != '\0') {		// ImWidgets change
+		p->patternCurrent[0] = '\0';
 		nsvg__popAttr(p);
 	} else if (strcmp(el, "text") == 0 && p->textFlag) {		// ImWidgets change
 		nsvg__flushText(p, 1);
@@ -4183,6 +4243,11 @@ void nsvgDelete(NSVGimage* image)
 		free(shape->image);
 		free(shape);
 		shape = snext;
+	}
+	while (image->patterns != NULL) {		// ImWidgets change
+		NSVGpattern* pat = image->patterns;
+		image->patterns = pat->next;
+		free(pat);
 	}
 	while (image->filters != NULL) {		// ImWidgets change
 		NSVGfilter* f = image->filters;
