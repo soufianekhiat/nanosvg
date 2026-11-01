@@ -155,6 +155,8 @@ typedef struct NSVGpath
 	struct NSVGpath* next;		// Pointer to next path, or NULL if last element.
 } NSVGpath;
 
+#define NSVG_MAX_FILTERS 4		// ImWidgets change: nested filters kept per shape.
+
 typedef struct NSVGshape
 {
 	char id[64];				// Optional 'id' attr of the shape or its group
@@ -191,6 +193,14 @@ typedef struct NSVGshape
 	// right, bottom left) in image space; its paths outline what shows of it (its innermost clip path, else its rectangle).
 	char* image;
 	float imageCorners[6];
+	// ImWidgets change: masks and filters, applied by the caller. maskId: the innermost mask over the shape; maskOf:
+	// the <mask> this shape is content of (not drawn itself). filterIds: the filters over the shape, outermost first;
+	// filterGroups: which element set each (the shapes of one group share its number).
+	char maskId[64];
+	char maskOf[64];
+	char filterIds[NSVG_MAX_FILTERS][64];
+	int filterGroups[NSVG_MAX_FILTERS];
+	int filterCount;
 } NSVGshape;
 
 enum NSVGtextAnchor {		// ImWidgets change
@@ -199,11 +209,41 @@ enum NSVGtextAnchor {		// ImWidgets change
 	NSVG_ANCHOR_END = 2,
 };
 
+// ImWidgets change: <filter> primitives as written (interpreted by the caller). Lengths in the user space of the
+// filtered element.
+enum NSVGfilterPrimType {
+	NSVG_FE_OTHER = 0, NSVG_FE_FLOOD, NSVG_FE_BLEND, NSVG_FE_COLOR_MATRIX, NSVG_FE_MORPHOLOGY, NSVG_FE_OFFSET,
+	NSVG_FE_GAUSSIAN_BLUR, NSVG_FE_COMPOSITE,
+};
+
+typedef struct NSVGfilterPrim
+{
+	int type;					// NSVGfilterPrimType.
+	char in[32], in2[32], result[32];
+	char op[16];				// feMorphology and feComposite operator, feBlend mode, feColorMatrix type.
+	float values[20];			// feColorMatrix.
+	int nvalues;
+	float dx, dy;				// feOffset.
+	float stdDeviation;			// feGaussianBlur (x).
+	float radius;				// feMorphology (x).
+	float k[4];					// feComposite arithmetic.
+	unsigned int floodColor;	// feFlood, with its opacity in alpha.
+	struct NSVGfilterPrim* next;
+} NSVGfilterPrim;
+
+typedef struct NSVGfilter
+{
+	char id[64];
+	NSVGfilterPrim* prims;
+	struct NSVGfilter* next;
+} NSVGfilter;
+
 typedef struct NSVGimage
 {
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	NSVGfilter* filters;		// ImWidgets change
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -505,6 +545,11 @@ typedef struct NSVGattrib
 	char hasStroke;
 	char visible;
     unsigned char paintOrder;
+	char maskId[64];		// ImWidgets change: NSVGshape::maskId and filterIds; filterOwn: this element set its last
+	char filterIds[NSVG_MAX_FILTERS][64];		// filter (styles can set it more than once).
+	int filterGroups[NSVG_MAX_FILTERS];
+	int filterCount;
+	char filterOwn;
 } NSVGattrib;
 
 typedef struct NSVGclipData		// ImWidgets change
@@ -547,6 +592,11 @@ typedef struct NSVGparser
 	// ImWidgets change: inside <clipPath>, its bounds collected from its shapes (no shapes are made).
 	struct NSVGclipData* clips;
 	struct NSVGclipData* clipCurrent;
+	// ImWidgets change: inside <mask>, its id (its shapes are made, tagged NSVGshape::maskOf); inside <filter>, the
+	// filter its primitives go to; the last filter group number given.
+	char maskCurrent[64];
+	NSVGfilter* filterCurrent;
+	int filterGroupCount;
 	char* textBuf;
 	int textLen, textCap;
 	float textX, textY;
@@ -871,6 +921,7 @@ static void nsvg__pushAttr(NSVGparser* p)
 	if (p->attrHead < NSVG_MAX_ATTR-1) {
 		p->attrHead++;
 		memcpy(&p->attr[p->attrHead], &p->attr[p->attrHead-1], sizeof(NSVGattrib));
+		p->attr[p->attrHead].filterOwn = 0;		// ImWidgets change
 	}
 }
 
@@ -1256,6 +1307,11 @@ static void nsvg__addShape(NSVGparser* p)
 	// Set flags
 	shape->flags = (attr->visible ? NSVG_FLAGS_VISIBLE : 0x00);
 	shape->hasClip = attr->hasClip;		// ImWidgets change
+	memcpy(shape->maskId, attr->maskId, sizeof(shape->maskId));
+	memcpy(shape->maskOf, p->maskCurrent, sizeof(shape->maskOf));
+	memcpy(shape->filterIds, attr->filterIds, sizeof(shape->filterIds));
+	memcpy(shape->filterGroups, attr->filterGroups, sizeof(shape->filterGroups));
+	shape->filterCount = attr->filterCount;
 	memcpy(shape->clipBounds, attr->clipBounds, sizeof(shape->clipBounds));
 
 	// Add to tail
@@ -2367,6 +2423,17 @@ static int nsvg__parseAttrStyling(NSVGparser* p, const char* name, const char* v
 		attr->fillRule = nsvg__parseFillRule(value);
 	} else if (strcmp(name, "font-size") == 0) {
 		attr->fontSize = nsvg__parseCoordinate(p, value, 0.0f, nsvg__actualLength(p));
+	} else if (strcmp(name, "mask") == 0) {		// ImWidgets change
+		attr->maskId[0] = '\0';
+		if (strncmp(value, "url(", 4) == 0) nsvg__parseUrl(attr->maskId, value);
+	} else if (strcmp(name, "filter") == 0) {		// ImWidgets change: appended to the ancestors' filters.
+		if (strncmp(value, "url(", 4) == 0 && (attr->filterOwn || attr->filterCount < NSVG_MAX_FILTERS)) {
+			if (!attr->filterOwn) {
+				attr->filterGroups[attr->filterCount++] = ++p->filterGroupCount;
+				attr->filterOwn = 1;
+			}
+			nsvg__parseUrl(attr->filterIds[attr->filterCount - 1], value);
+		}
 	} else if (strcmp(name, "clip-path") == 0) {		// ImWidgets change: applied once the element's transform is known.
 		const char* id = strstr(value, "url(#");
 		attr->clipPending[0] = '\0';
@@ -3514,9 +3581,84 @@ static void nsvg__parseImage(NSVGparser* p, const char** attr)
 	}
 }
 
+// ImWidgets change: a filter primitive's attributes, appended to the filter being read.
+static void nsvg__parseFilterPrim(NSVGparser* p, const char* el, const char** attr)
+{
+	NSVGfilterPrim* prim = (NSVGfilterPrim*)calloc(1, sizeof(NSVGfilterPrim));
+	NSVGfilterPrim** tail;
+	float floodOpacity = 1.0f;
+	int i;
+	if (prim == NULL) return;
+	if (strcmp(el, "feFlood") == 0) prim->type = NSVG_FE_FLOOD;
+	else if (strcmp(el, "feBlend") == 0) prim->type = NSVG_FE_BLEND;
+	else if (strcmp(el, "feColorMatrix") == 0) prim->type = NSVG_FE_COLOR_MATRIX;
+	else if (strcmp(el, "feMorphology") == 0) prim->type = NSVG_FE_MORPHOLOGY;
+	else if (strcmp(el, "feOffset") == 0) prim->type = NSVG_FE_OFFSET;
+	else if (strcmp(el, "feGaussianBlur") == 0) prim->type = NSVG_FE_GAUSSIAN_BLUR;
+	else if (strcmp(el, "feComposite") == 0) prim->type = NSVG_FE_COMPOSITE;
+	for (i = 0; attr[i]; i += 2) {
+		const char* name = attr[i];
+		const char* value = attr[i + 1];
+		char it[64];
+		if (strcmp(name, "in") == 0) strncpy(prim->in, value, 31);
+		else if (strcmp(name, "in2") == 0) strncpy(prim->in2, value, 31);
+		else if (strcmp(name, "result") == 0) strncpy(prim->result, value, 31);
+		else if (strcmp(name, "operator") == 0 || strcmp(name, "mode") == 0 || strcmp(name, "type") == 0) strncpy(prim->op, value, 15);
+		else if (strcmp(name, "dx") == 0) prim->dx = (float)nsvg__atof(value);
+		else if (strcmp(name, "dy") == 0) prim->dy = (float)nsvg__atof(value);
+		else if (strcmp(name, "stdDeviation") == 0) prim->stdDeviation = (float)nsvg__atof(value);
+		else if (strcmp(name, "radius") == 0) prim->radius = (float)nsvg__atof(value);
+		else if (name[0] == 'k' && name[1] >= '1' && name[1] <= '4' && name[2] == '\0') prim->k[name[1] - '1'] = (float)nsvg__atof(value);
+		else if (strcmp(name, "flood-color") == 0) prim->floodColor = nsvg__parseColor(value);
+		else if (strcmp(name, "flood-opacity") == 0) floodOpacity = (float)nsvg__atof(value);
+		else if (strcmp(name, "values") == 0) {
+			const char* v = value;
+			while (prim->nvalues < 20) {
+				v = nsvg__getNextPathItem(v, it);
+				if (it[0] == '\0') break;
+				prim->values[prim->nvalues++] = (float)nsvg__atof(it);
+			}
+		}
+	}
+	floodOpacity = floodOpacity < 0.0f ? 0.0f : floodOpacity > 1.0f ? 1.0f : floodOpacity;
+	prim->floodColor = (prim->floodColor & 0xffffff) | ((unsigned int)(floodOpacity * 255.0f) << 24);
+	for (tail = &p->filterCurrent->prims; *tail != NULL; tail = &(*tail)->next) {}
+	*tail = prim;
+}
+
 static void nsvg__startElement(void* ud, const char* el, const char** attr)
 {
 	NSVGparser* p = (NSVGparser*)ud;
+
+	if (strcmp(el, "filter") == 0) {		// ImWidgets change: its primitives, for the caller.
+		NSVGfilter* f = (NSVGfilter*)calloc(1, sizeof(NSVGfilter));
+		int i;
+		if (f == NULL) return;
+		for (i = 0; attr[i]; i += 2)
+			if (strcmp(attr[i], "id") == 0) strncpy(f->id, attr[i + 1], 63);
+		f->next = p->image->filters;
+		p->image->filters = f;
+		p->filterCurrent = f;
+		return;
+	}
+	if (p->filterCurrent != NULL) {
+		if (el[0] == 'f' && el[1] == 'e')
+			nsvg__parseFilterPrim(p, el, attr);
+		return;
+	}
+	if (strcmp(el, "mask") == 0) {		// ImWidgets change: its shapes are made, tagged with its id.
+		int i;
+		nsvg__pushAttr(p);
+		nsvg__getAttr(p)->hasClip = 0;
+		nsvg__getAttr(p)->clipData = NULL;
+		nsvg__getAttr(p)->maskId[0] = '\0';
+		nsvg__getAttr(p)->filterCount = 0;
+		nsvg__cascade(p, el, attr);
+		p->cascaded = 0;
+		for (i = 0; attr[i]; i += 2)
+			if (strcmp(attr[i], "id") == 0) strncpy(p->maskCurrent, attr[i + 1], 63);
+		return;
+	}
 
 	if (strcmp(el, "clipPath") == 0) {		// ImWidgets change: its bounds, from the shapes inside.
 		NSVGclipData* c = (NSVGclipData*)calloc(1, sizeof(NSVGclipData));
@@ -3532,7 +3674,7 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		nsvg__getAttr(p)->hasClip = 0;
 		return;
 	}
-	if (p->defsFlag && p->clipCurrent == NULL) {
+	if (p->defsFlag && p->clipCurrent == NULL && p->maskCurrent[0] == '\0') {
 		// Skip everything but gradients and styles in defs
 		if (strcmp(el, "linearGradient") == 0) {
 			nsvg__parseGradient(p, attr, NSVG_PAINT_LINEAR_GRADIENT);
@@ -3640,6 +3782,11 @@ static void nsvg__endElement(void* ud, const char* el)
 		nsvg__popAttr(p);
 	} else if (strcmp(el, "clipPath") == 0 && p->clipCurrent != NULL) {		// ImWidgets change
 		p->clipCurrent = NULL;
+		nsvg__popAttr(p);
+	} else if (strcmp(el, "filter") == 0) {		// ImWidgets change
+		p->filterCurrent = NULL;
+	} else if (strcmp(el, "mask") == 0 && p->maskCurrent[0] != '\0') {		// ImWidgets change
+		p->maskCurrent[0] = '\0';
 		nsvg__popAttr(p);
 	} else if (strcmp(el, "text") == 0 && p->textFlag) {		// ImWidgets change
 		nsvg__flushText(p, 1);
@@ -4036,6 +4183,16 @@ void nsvgDelete(NSVGimage* image)
 		free(shape->image);
 		free(shape);
 		shape = snext;
+	}
+	while (image->filters != NULL) {		// ImWidgets change
+		NSVGfilter* f = image->filters;
+		image->filters = f->next;
+		while (f->prims != NULL) {
+			NSVGfilterPrim* prim = f->prims;
+			f->prims = prim->next;
+			free(prim);
+		}
+		free(f);
 	}
 	free(image);
 }
