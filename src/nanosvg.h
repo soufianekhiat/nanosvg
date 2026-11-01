@@ -215,13 +215,14 @@ enum NSVGtextAnchor {		// ImWidgets change
 enum NSVGfilterPrimType {
 	NSVG_FE_OTHER = 0, NSVG_FE_FLOOD, NSVG_FE_BLEND, NSVG_FE_COLOR_MATRIX, NSVG_FE_MORPHOLOGY, NSVG_FE_OFFSET,
 	NSVG_FE_GAUSSIAN_BLUR, NSVG_FE_COMPOSITE,
+	NSVG_FE_COMPONENT_TRANSFER, NSVG_FE_FUNC, NSVG_FE_MERGE, NSVG_FE_MERGE_NODE,	// feFunc* and feMergeNode follow their parent.
 };
 
 typedef struct NSVGfilterPrim
 {
 	int type;					// NSVGfilterPrimType.
 	char in[32], in2[32], result[32];
-	char op[16];				// feMorphology and feComposite operator, feBlend mode, feColorMatrix type.
+	char op[24];				// feMorphology and feComposite operator, feBlend mode, feColorMatrix and feFunc* type.
 	float values[20];			// feColorMatrix.
 	int nvalues;
 	float dx, dy;				// feOffset.
@@ -229,12 +230,17 @@ typedef struct NSVGfilterPrim
 	float radius;				// feMorphology (x).
 	float k[4];					// feComposite arithmetic.
 	unsigned int floodColor;	// feFlood, with its opacity in alpha.
+	char channel;				// feFunc*: 'R', 'G', 'B' or 'A'; and its function's parameters.
+	float table[32];
+	int ntable;
+	float slope, intercept, amplitude, exponent, offset;
 	struct NSVGfilterPrim* next;
 } NSVGfilterPrim;
 
 typedef struct NSVGfilter
 {
 	char id[64];
+	char sRGB;					// color-interpolation-filters="sRGB" (else linearRGB, the default).
 	NSVGfilterPrim* prims;
 	struct NSVGfilter* next;
 } NSVGfilter;
@@ -3619,6 +3625,11 @@ static void nsvg__parseFilterPrim(NSVGparser* p, const char* el, const char** at
 	else if (strcmp(el, "feOffset") == 0) prim->type = NSVG_FE_OFFSET;
 	else if (strcmp(el, "feGaussianBlur") == 0) prim->type = NSVG_FE_GAUSSIAN_BLUR;
 	else if (strcmp(el, "feComposite") == 0) prim->type = NSVG_FE_COMPOSITE;
+	else if (strcmp(el, "feComponentTransfer") == 0) prim->type = NSVG_FE_COMPONENT_TRANSFER;
+	else if (strcmp(el, "feMerge") == 0) prim->type = NSVG_FE_MERGE;
+	else if (strcmp(el, "feMergeNode") == 0) prim->type = NSVG_FE_MERGE_NODE;
+	else if (strncmp(el, "feFunc", 6) == 0 && el[6] != '\0' && el[7] == '\0') { prim->type = NSVG_FE_FUNC; prim->channel = el[6]; }
+	prim->slope = prim->amplitude = prim->exponent = 1.0f;
 	for (i = 0; attr[i]; i += 2) {
 		const char* name = attr[i];
 		const char* value = attr[i + 1];
@@ -3626,7 +3637,20 @@ static void nsvg__parseFilterPrim(NSVGparser* p, const char* el, const char** at
 		if (strcmp(name, "in") == 0) strncpy(prim->in, value, 31);
 		else if (strcmp(name, "in2") == 0) strncpy(prim->in2, value, 31);
 		else if (strcmp(name, "result") == 0) strncpy(prim->result, value, 31);
-		else if (strcmp(name, "operator") == 0 || strcmp(name, "mode") == 0 || strcmp(name, "type") == 0) strncpy(prim->op, value, 15);
+		else if (strcmp(name, "operator") == 0 || strcmp(name, "mode") == 0 || strcmp(name, "type") == 0) strncpy(prim->op, value, 23);
+		else if (strcmp(name, "slope") == 0) prim->slope = (float)nsvg__atof(value);
+		else if (strcmp(name, "intercept") == 0) prim->intercept = (float)nsvg__atof(value);
+		else if (strcmp(name, "amplitude") == 0) prim->amplitude = (float)nsvg__atof(value);
+		else if (strcmp(name, "exponent") == 0) prim->exponent = (float)nsvg__atof(value);
+		else if (strcmp(name, "offset") == 0) prim->offset = (float)nsvg__atof(value);
+		else if (strcmp(name, "tableValues") == 0) {
+			const char* v = value;
+			while (prim->ntable < 32) {
+				v = nsvg__getNextPathItem(v, it);
+				if (it[0] == '\0') break;
+				prim->table[prim->ntable++] = (float)nsvg__atof(it);
+			}
+		}
 		else if (strcmp(name, "dx") == 0) prim->dx = (float)nsvg__atof(value);
 		else if (strcmp(name, "dy") == 0) prim->dy = (float)nsvg__atof(value);
 		else if (strcmp(name, "stdDeviation") == 0) prim->stdDeviation = (float)nsvg__atof(value);
@@ -3657,8 +3681,12 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 		NSVGfilter* f = (NSVGfilter*)calloc(1, sizeof(NSVGfilter));
 		int i;
 		if (f == NULL) return;
-		for (i = 0; attr[i]; i += 2)
+		for (i = 0; attr[i]; i += 2) {
 			if (strcmp(attr[i], "id") == 0) strncpy(f->id, attr[i + 1], 63);
+			else if ((strcmp(attr[i], "color-interpolation-filters") == 0 && strcmp(attr[i + 1], "sRGB") == 0)
+				|| (strcmp(attr[i], "style") == 0 && strstr(attr[i + 1], "color-interpolation-filters:sRGB") != NULL))
+				f->sRGB = 1;
+		}
 		f->next = p->image->filters;
 		p->image->filters = f;
 		p->filterCurrent = f;
