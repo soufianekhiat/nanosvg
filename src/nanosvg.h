@@ -201,6 +201,7 @@ typedef struct NSVGshape
 	char patternOf[64];			// The <pattern> this shape is content of (in the pattern's space; not drawn itself).
 	char filterIds[NSVG_MAX_FILTERS][64];
 	int filterGroups[NSVG_MAX_FILTERS];
+	float filterXforms[NSVG_MAX_FILTERS][6];	// The user space of the element that set each filter (its region, offsets).
 	int filterCount;
 } NSVGshape;
 
@@ -241,6 +242,8 @@ typedef struct NSVGfilter
 {
 	char id[64];
 	char sRGB;					// color-interpolation-filters="sRGB" (else linearRGB, the default).
+	char hasRegion;				// filterUnits="userSpaceOnUse" with x, y, width and height: the region its results are cut to.
+	float x, y, width, height;
 	NSVGfilterPrim* prims;
 	struct NSVGfilter* next;
 } NSVGfilter;
@@ -575,6 +578,7 @@ typedef struct NSVGattrib
 	char maskId[64];		// ImWidgets change: NSVGshape::maskId and filterIds; filterOwn: this element set its last
 	char filterIds[NSVG_MAX_FILTERS][64];		// filter (styles can set it more than once).
 	int filterGroups[NSVG_MAX_FILTERS];
+	float filterXforms[NSVG_MAX_FILTERS][6];
 	int filterCount;
 	char filterOwn;
 } NSVGattrib;
@@ -1211,6 +1215,8 @@ static void nsvg__applyClip(NSVGparser* p)
 	NSVGclipData* c;
 	float b[4], x, y;
 	int k;
+	if (attr->filterOwn && attr->filterCount > 0)		// Its filter's user space: its transform, now known.
+		memcpy(attr->filterXforms[attr->filterCount - 1], attr->xform, sizeof(attr->xform));
 	if (attr->clipPending[0] == '\0')
 		return;
 	for (c = p->clips; c != NULL && strcmp(c->id, attr->clipPending) != 0; c = c->next) {}
@@ -1340,6 +1346,7 @@ static void nsvg__addShape(NSVGparser* p)
 	memcpy(shape->patternOf, p->patternCurrent, sizeof(shape->patternOf));
 	memcpy(shape->filterIds, attr->filterIds, sizeof(shape->filterIds));
 	memcpy(shape->filterGroups, attr->filterGroups, sizeof(shape->filterGroups));
+	memcpy(shape->filterXforms, attr->filterXforms, sizeof(shape->filterXforms));
 	shape->filterCount = attr->filterCount;
 	memcpy(shape->clipBounds, attr->clipBounds, sizeof(shape->clipBounds));
 
@@ -3679,14 +3686,20 @@ static void nsvg__startElement(void* ud, const char* el, const char** attr)
 
 	if (strcmp(el, "filter") == 0) {		// ImWidgets change: its primitives, for the caller.
 		NSVGfilter* f = (NSVGfilter*)calloc(1, sizeof(NSVGfilter));
-		int i;
+		int i, region = 0;
 		if (f == NULL) return;
 		for (i = 0; attr[i]; i += 2) {
 			if (strcmp(attr[i], "id") == 0) strncpy(f->id, attr[i + 1], 63);
+			else if (strcmp(attr[i], "filterUnits") == 0 && strcmp(attr[i + 1], "userSpaceOnUse") == 0) region |= 16;
+			else if (strcmp(attr[i], "x") == 0) { f->x = (float)nsvg__atof(attr[i + 1]); region |= 1; }
+			else if (strcmp(attr[i], "y") == 0) { f->y = (float)nsvg__atof(attr[i + 1]); region |= 2; }
+			else if (strcmp(attr[i], "width") == 0) { f->width = (float)nsvg__atof(attr[i + 1]); region |= 4; }
+			else if (strcmp(attr[i], "height") == 0) { f->height = (float)nsvg__atof(attr[i + 1]); region |= 8; }
 			else if ((strcmp(attr[i], "color-interpolation-filters") == 0 && strcmp(attr[i + 1], "sRGB") == 0)
 				|| (strcmp(attr[i], "style") == 0 && strstr(attr[i + 1], "color-interpolation-filters:sRGB") != NULL))
 				f->sRGB = 1;
 		}
+		f->hasRegion = region == 31;
 		f->next = p->image->filters;
 		p->image->filters = f;
 		p->filterCurrent = f;
@@ -4101,6 +4114,13 @@ static void nsvg__scaleToViewbox(NSVGparser* p, const char* units)
 		for (i = 0; i < 3; i++) {		// ImWidgets change: image corners
 			shape->imageCorners[i * 2] = (shape->imageCorners[i * 2] + tx) * sx;
 			shape->imageCorners[i * 2 + 1] = (shape->imageCorners[i * 2 + 1] + ty) * sy;
+		}
+		// ImWidgets change: the shape's transform to the scaled pixels too (its effects and patterns use it).
+		shape->xform[0] *= sx; shape->xform[1] *= sy; shape->xform[2] *= sx; shape->xform[3] *= sy;
+		shape->xform[4] = (shape->xform[4] + tx) * sx; shape->xform[5] = (shape->xform[5] + ty) * sy;
+		for (i = 0; i < shape->filterCount; i++) {
+			float* f = shape->filterXforms[i];
+			f[0] *= sx; f[1] *= sy; f[2] *= sx; f[3] *= sy; f[4] = (f[4] + tx) * sx; f[5] = (f[5] + ty) * sy;
 		}
 		shape->clipBounds[0] = (shape->clipBounds[0] + tx) * sx;		// ImWidgets change
 		shape->clipBounds[1] = (shape->clipBounds[1] + ty) * sy;
